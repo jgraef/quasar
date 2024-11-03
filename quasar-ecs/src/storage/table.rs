@@ -5,11 +5,17 @@ use crate::{
         ComponentId,
         ComponentInfo,
     },
-    entity::Entity,
+    entity::{
+        ChangedLocation,
+        Entity,
+    },
     storage::column::Column,
-    util::sparse_map::{
-        ImmutableSparseMap,
-        SparseMap,
+    util::{
+        slice_get_mut_pair,
+        sparse_map::{
+            ImmutableSparseMap,
+            SparseMap,
+        }, Joined,
     },
 };
 
@@ -40,6 +46,14 @@ impl TableRow {
     fn from_index(index: usize) -> Self {
         Self(index.try_into().expect("TableRow overflow"))
     }
+
+    pub fn is_invalid(&self) -> bool {
+        *self == Self::INVALID
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.is_invalid()
+    }
 }
 
 #[derive(Debug)]
@@ -49,16 +63,6 @@ pub struct Table {
 }
 
 impl Table {
-    unsafe fn swap_remove_unchecked(&mut self, row: TableRow) -> Option<Entity> {
-        let row_index = row.0 as usize;
-        let is_last = row_index == self.entities.len();
-        for column in self.columns.values_mut() {
-            column.swap_remove_unchecked(row_index);
-        }
-        self.entities.swap_remove(row_index);
-        (!is_last).then(|| self.entities[row_index])
-    }
-
     pub fn get_column(&self, component_id: ComponentId) -> Option<&Column> {
         self.columns.get(&component_id)
     }
@@ -99,11 +103,8 @@ impl Table {
 
     pub fn insert(&mut self, entity: Entity) -> InsertIntoTable {
         let index = self.entities.len();
-        InsertIntoTable {
-            table: self,
-            index,
-            entity,
-        }
+        self.entities.push(entity);
+        InsertIntoTable { table: self, index }
     }
 
     pub fn component_ids(&self) -> impl Iterator<Item = ComponentId> + use<'_> {
@@ -127,23 +128,107 @@ impl Table {
         let column = self.columns.get_mut(&component_id)?;
         Some(&mut column.get_mut_slice()[table_row.index()])
     }
+
+    pub unsafe fn move_row<'t>(&mut self, from_row: TableRow, to_table: &'t mut Self, entity: Entity) -> MoveRowResult<'t> {
+        to_table.entities.push(entity);
+        let to_row = TableRow::from_index(self.entities.len());
+
+        let swapped = if from_row.is_valid() {
+            let from_row_index = from_row.index();
+            assert!(from_row_index < self.entities.len(), "row_index ({from_row_index}) < self.entities.len() ({})", self.entities.len());
+    
+            let swapped = from_row_index != self.entities.len() - 1;
+    
+            let removed_entity = self.entities.swap_remove(from_row_index);
+            assert_eq!(removed_entity, entity);
+    
+            for (component_id, from_column) in &mut self.columns {
+                if let Some(to_column) = to_table.get_column_mut(component_id) {
+                    from_column.move_item(from_row_index, to_column);
+                }
+                else {
+                    from_column.remove_item(from_row_index);
+                }
+            }
+
+            swapped.then(|| {
+                ChangedLocation {
+                    entity: self.entities[from_row_index],
+                    changed_value: from_row,
+                }
+            })
+        }
+        else {
+            None
+        };
+
+        MoveRowResult {
+            swapped,
+            insert: InsertIntoTable {
+                table: to_table,
+                index: to_row.index(),
+            },
+        }
+    }
+
+    pub unsafe fn remove_row(&mut self, row: TableRow) -> Option<ChangedLocation<TableRow>> {
+        if row.is_invalid() {
+            return None;
+        }
+
+        let row_index = row.0 as usize;
+        assert!(row_index < self.entities.len(), "row_index ({row_index}) < self.entities.len() ({})", self.entities.len());
+
+        let swapped = row_index != self.entities.len() - 1;
+
+        self.entities.swap_remove(row_index);
+
+        for column in self.columns.values_mut() {
+            column.remove_item(row_index);
+        }
+
+        swapped.then(|| {
+            ChangedLocation {
+                entity: self.entities[row_index],
+                changed_value: row,
+            }
+        })
+    }
 }
 
+#[derive(Debug)]
+pub struct MoveRowResult<'a> {
+    pub swapped: Option<ChangedLocation<TableRow>>,
+    pub insert: InsertIntoTable<'a>,
+}
+
+impl<'a> MoveRowResult<'a> {
+    pub fn to_row(&self) -> TableRow {
+        self.insert.table_row()
+    }
+}
+
+#[derive(Debug)]
 pub struct InsertIntoTable<'a> {
     table: &'a mut Table,
     index: usize,
-    entity: Entity,
 }
 
 impl<'a> InsertIntoTable<'a> {
     pub unsafe fn write_column<T>(&mut self, component_id: ComponentId, value: T) {
-        let column = self.table.get_column_mut(component_id).unwrap();
+        let column = if let Some(column) = self.table.get_column_mut(component_id) {
+            column
+        }
+        else {
+            let component_ids = self.table.component_ids().collect::<Box<[ComponentId]>>();
+            panic!("trying to write to column {component_id:?} to, but table has only columns [{:?}]", Joined::new(", ", &component_ids));
+        };
+
         assert_eq!(column.len(), self.index);
         column.push(value);
     }
 
-    pub unsafe fn finish(self) -> TableRow {
-        self.table.entities.push(self.entity);
+    pub fn table_row(&self) -> TableRow {
         TableRow::from_index(self.index)
     }
 }
@@ -218,6 +303,14 @@ impl Tables {
 
     pub fn get_mut(&mut self, table_id: TableId) -> &mut Table {
         &mut self.tables[table_id.index()]
+    }
+
+    pub fn get_mut_pair(
+        &mut self,
+        first: TableId,
+        second: TableId,
+    ) -> Result<(&mut Table, &mut Table), &mut Table> {
+        slice_get_mut_pair(&mut self.tables, first.index(), second.index())
     }
 
     pub fn clear(&mut self) {

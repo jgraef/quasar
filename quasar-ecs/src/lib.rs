@@ -10,10 +10,26 @@ mod world;
 
 extern crate alloc;
 
-pub use self::world::{
-    EntityIter,
-    EntityMut,
-    EntityRef,
-    World,
-    WorldId,
+// hack to get the proc-macro working from this crate
+extern crate self as quasar_ecs;
+
+pub use crate::{
+    bundle::Bundle,
+    component::Component,
+    storage::StorageType,
+    world::{
+        EntityIter,
+        EntityMut,
+        EntityRef,
+        World,
+        WorldId,
+    },
 };
+
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::bundle::{
+        ForEachComponent,
+        IntoEachComponent,
+    };
+}

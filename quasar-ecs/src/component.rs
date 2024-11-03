@@ -4,28 +4,22 @@ use std::{
         type_name,
         TypeId,
     },
-    collections::hash_map,
     mem::needs_drop,
 };
-
-use bevy_ptr::OwningPtr;
-
-pub trait Component: 'static {
-    const STORAGE_TYPE: StorageType;
-}
 
 use crate::{
     storage::StorageType,
     util::{
         drop_ptr,
         sparse_map::SparseMapKey,
-        type_id_map::{
-            self,
-            TypeIdMap,
-        },
+        type_id_map::{self, TypeIdMap},
         DropFn,
     },
 };
+
+pub trait Component: 'static {
+    const STORAGE_TYPE: StorageType;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ComponentId(usize);
@@ -101,8 +95,8 @@ pub struct Components {
 impl Components {
     pub fn register<C: Component>(&mut self) -> &mut ComponentInfo {
         let index = match self.by_type.entry::<C>() {
-            hash_map::Entry::Occupied(occupied_entry) => occupied_entry.get().index(),
-            hash_map::Entry::Vacant(vacant_entry) => {
+            type_id_map::Entry::Occupied(occupied_entry) => occupied_entry.get().index(),
+            type_id_map::Entry::Vacant(vacant_entry) => {
                 let index = self.components.len();
                 let id = ComponentId(index);
                 self.components.push(ComponentInfo {

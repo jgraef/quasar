@@ -13,12 +13,11 @@ pub struct Resources {
 
 impl Resources {
     pub fn insert<R: Resource>(&mut self, resource: R) -> &mut R {
-        let resource = self
+        let (_resource, occupied_entry) = self
             .resources
             .entry::<R>()
-            .insert_entry(Box::new(resource))
-            .into_mut();
-        resource.as_any_mut().downcast_mut().unwrap()
+            .insert(Box::new(resource));
+        occupied_entry.into_mut().as_any_mut().downcast_mut().unwrap()
     }
 
     pub fn get<R: Resource>(&self) -> Option<&R> {
@@ -36,10 +35,10 @@ impl Resources {
     }
 
     pub fn get_mut_or_insert_with<R: Resource>(&mut self, default: impl FnOnce() -> R) -> &mut R {
-        self.resources
+        let occupied_entry = self.resources
             .entry::<R>()
-            .or_insert_with(|| Box::new(default()))
-            .as_any_mut()
+            .or_insert_with(|| Box::new(default()));
+            occupied_entry.into_mut().as_any_mut()
             .downcast_mut()
             .unwrap()
     }

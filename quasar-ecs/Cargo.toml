@@ -3,6 +3,15 @@ name = "quasar-ecs"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["full"]
+full = ["derive"]
+derive = ["dep:quasar-ecs-derive"]
+
+[dependencies.quasar-ecs-derive]
+workspace = true
+optional = true
+
 [dependencies]
 bevy_ptr = "0.14.2"
 downcast-rs = "1.2.1"

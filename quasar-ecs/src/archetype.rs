@@ -10,7 +10,10 @@ use crate::{
         ComponentId,
         ComponentInfo,
     },
-    entity::Entity,
+    entity::{
+        ChangedLocation,
+        Entity,
+    },
     storage::{
         table::{
             Table,
@@ -22,6 +25,7 @@ use crate::{
         StorageType,
     },
     util::{
+        slice_get_mut_pair,
         sparse_map::{
             self,
             ImmutableSparseMap,
@@ -44,18 +48,29 @@ pub struct Archetype {
 }
 
 impl Archetype {
-    pub fn insert(&mut self, archetype_entity: ArchetypeEntity) -> ArchetypeRow {
+    pub fn insert_entity(&mut self, archetype_entity: ArchetypeEntity) -> ArchetypeRow {
         let index = self.entities.len();
         self.entities.push(archetype_entity);
         ArchetypeRow::from_index(index)
     }
 
-    pub fn remove(&mut self, archetype_row: ArchetypeRow) -> ArchetypeRemoveEntityResult {
-        let index = archetype_row.index();
-        let archetype_entity = self.entities.swap_remove(index);
-        ArchetypeRemoveEntityResult {
-            archetype_entity,
-            swapped_entity: self.entities[index].entity,
+    pub fn remove_entity(
+        &mut self,
+        archetype_row: ArchetypeRow,
+    ) -> Option<ChangedLocation<ArchetypeRow>> {
+        if archetype_row.is_invalid() {
+            None
+        }
+        else {
+            let index = archetype_row.index();
+            let swapped = index != self.entities.len() - 1;
+            let _removed_entity = self.entities.swap_remove(index);
+            swapped.then(|| {
+                ChangedLocation {
+                    entity: self.entities[index].entity,
+                    changed_value: archetype_row,
+                }
+            })
         }
     }
 
@@ -70,12 +85,10 @@ impl Archetype {
     pub fn contains_component(&self, component_id: ComponentId) -> bool {
         self.components.contains_key(&component_id)
     }
-}
 
-#[derive(Clone, Copy, Debug)]
-pub struct ArchetypeRemoveEntityResult {
-    pub archetype_entity: ArchetypeEntity,
-    pub swapped_entity: Entity,
+    pub fn add_bundle(&self, bundle_id: BundleId) -> Option<&AddBundle> {
+        self.edges.add_bundle.get(&bundle_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -108,6 +121,14 @@ impl ArchetypeRow {
 
     fn from_index(index: usize) -> Self {
         Self(index.try_into().expect("ArchetypeRow overflow"))
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        *self == Self::INVALID
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.is_invalid()
     }
 }
 
@@ -174,90 +195,99 @@ impl Archetypes {
         }
     }
 
-    pub fn add_bundle<'i>(
+    pub fn add_bundle<'i, 'b>(
         &mut self,
         archetype_id: ArchetypeId,
         bundle_info: &BundleInfo,
         get_component_info: impl Fn(ComponentId) -> &'i ComponentInfo,
         insert_table: impl FnOnce(Table) -> TableId,
-    ) -> &AddBundle {
-        let source_index = archetype_id.index();
-        let reserved_archetype_id = ArchetypeId::from_index(self.archetypes.len());
-
-        let source = &mut self.archetypes[source_index];
-
-        if !source.edges.add_bundle.contains_key(&bundle_info.id()) {
-            let existing = &source.components;
-            let mut duplicate = SparseSet::with_capacity(existing.len());
-
-            let mut component_ids =
-                Vec::with_capacity(existing.len() + bundle_info.component_ids().len());
-            component_ids.extend(existing.keys());
-            for component_id in bundle_info.component_ids() {
-                if existing.contains_key(component_id) {
-                    duplicate.insert(component_id);
-                }
-                else {
-                    component_ids.push(*component_id);
-                }
-            }
-            component_ids.sort_unstable();
-            let component_ids: Box<[ComponentId]> = component_ids.into();
-
-            let output_archetype_id = self
-                .by_components
-                .get(&component_ids)
-                .copied()
-                .unwrap_or_else(|| {
-                    let mut table_builder = TableBuilder::new(1, component_ids.len());
-                    let mut archetype_component_infos =
-                        SparseMap::with_capacity(component_ids.len());
-
-                    for component_id in &component_ids {
-                        let component_info = get_component_info(*component_id);
-                        table_builder.add_column(component_info);
-                        archetype_component_infos
-                            .insert(component_id, ArchetypeComponentInfo::from(component_info));
-                    }
-
-                    let table_id = insert_table(table_builder.build());
-
-                    for component_id in &component_ids {
-                        self.by_component
-                            .entry(*component_id)
-                            .or_default()
-                            .push(reserved_archetype_id);
-                    }
-                    self.by_components
-                        .insert(component_ids, reserved_archetype_id);
-                    self.archetypes.push(Archetype {
-                        id: reserved_archetype_id,
-                        table_id,
-                        entities: Vec::with_capacity(1),
-                        components: archetype_component_infos.into(),
-                        edges: Edges::default(),
-                    });
-
-                    reserved_archetype_id
-                });
-
-            let source = &mut self.archetypes[source_index];
-            source.edges.add_bundle.insert(
-                &bundle_info.id(),
-                AddBundle {
-                    output_archetype_id,
-                    duplicate: duplicate.into(),
-                },
-            );
+    ) -> Option<(&mut Archetype, &mut Archetype)> {
+        if bundle_info.is_empty() {
+            return None;
         }
 
-        let source = &mut self.archetypes[source_index];
-        source
-            .edges
-            .add_bundle
-            .get(&bundle_info.id())
-            .as_ref()
-            .unwrap()
+        let from_archetype_index = archetype_id.index();
+        let reserved_archetype_id = ArchetypeId::from_index(self.archetypes.len());
+
+        let from_archetype = &mut self.archetypes[from_archetype_index];
+
+        let to_archetype_id =
+            if let Some(add_bundle) = from_archetype.edges.add_bundle.get(&bundle_info.id()) {
+                add_bundle.archetype_id
+            }
+            else {
+                let existing = &from_archetype.components;
+                let mut duplicate = SparseSet::with_capacity(existing.len());
+
+                let mut component_ids =
+                    Vec::with_capacity(existing.len() + bundle_info.component_ids().len());
+                component_ids.extend(existing.keys());
+                for component_id in bundle_info.component_ids() {
+                    if existing.contains_key(component_id) {
+                        duplicate.insert(component_id);
+                    }
+                    else {
+                        component_ids.push(*component_id);
+                    }
+                }
+                component_ids.sort_unstable();
+                let component_ids: Box<[ComponentId]> = component_ids.into();
+
+                let to_archetype_id = self
+                    .by_components
+                    .get(&component_ids)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let mut table_builder = TableBuilder::new(1, component_ids.len());
+                        let mut archetype_component_infos =
+                            SparseMap::with_capacity(component_ids.len());
+
+                        for component_id in &component_ids {
+                            let component_info = get_component_info(*component_id);
+                            table_builder.add_column(component_info);
+                            archetype_component_infos
+                                .insert(component_id, ArchetypeComponentInfo::from(component_info));
+                        }
+
+                        let table_id = insert_table(table_builder.build());
+
+                        for component_id in &component_ids {
+                            self.by_component
+                                .entry(*component_id)
+                                .or_default()
+                                .push(reserved_archetype_id);
+                        }
+                        self.by_components
+                            .insert(component_ids, reserved_archetype_id);
+                        self.archetypes.push(Archetype {
+                            id: reserved_archetype_id,
+                            table_id,
+                            entities: Vec::with_capacity(1),
+                            components: archetype_component_infos.into(),
+                            edges: Edges::default(),
+                        });
+
+                        reserved_archetype_id
+                    });
+
+                let source = &mut self.archetypes[from_archetype_index];
+                source.edges.add_bundle.insert(
+                    &bundle_info.id(),
+                    AddBundle {
+                        archetype_id: to_archetype_id,
+                        duplicate: duplicate.into(),
+                    },
+                );
+
+                to_archetype_id
+            };
+
+        slice_get_mut_pair(
+            &mut self.archetypes,
+            from_archetype_index,
+            to_archetype_id.index(),
+        )
+        .ok()
     }
 }
 
@@ -281,7 +311,7 @@ struct Edges {
 
 #[derive(Debug)]
 pub struct AddBundle {
-    pub output_archetype_id: ArchetypeId,
+    pub archetype_id: ArchetypeId,
     pub duplicate: ImmutableSparseSet<ComponentId>,
 }
 

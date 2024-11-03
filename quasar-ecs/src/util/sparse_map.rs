@@ -276,8 +276,8 @@ pub struct VacantEntry<'a, K, V> {
 
 impl<'a, K, V> VacantEntry<'a, K, V> {
     pub fn insert(self, value: V) -> OccupiedEntry<'a, K, V> {
-        if self.index > self.map.values.len() {
-            self.map.values.resize_with(self.index, || None);
+        if self.index >= self.map.values.len() {
+            self.map.values.resize_with(self.index + 1, || None);
         }
         self.map.values[self.index] = Some(value);
         self.map.len += 1;

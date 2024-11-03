@@ -34,10 +34,6 @@ impl Column {
         }
     }
 
-    pub unsafe fn swap_remove_unchecked(&mut self, row: usize) {
-        self.data.swap_remove_and_drop_unchecked(row);
-    }
-
     pub fn reserve(&mut self, additional: usize) {
         self.data.reserve(additional);
     }
@@ -70,5 +66,14 @@ impl Column {
         OwningPtr::make(value, |ptr| {
             self.data.push(ptr);
         });
+    }
+
+    pub unsafe fn move_item(&mut self, index: usize, to_column: &mut Self) {
+        let ptr = self.data.swap_remove_and_forget_unchecked(index);
+        to_column.push(ptr);
+    }
+
+    pub unsafe fn remove_item(&mut self, index: usize) {
+        self.data.swap_remove_and_drop_unchecked(index);
     }
 }

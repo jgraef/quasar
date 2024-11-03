@@ -41,7 +41,7 @@ impl Entity {
         u64::from(self.index) | u64::from(self.generation.0.get()) << 32
     }
 
-    pub fn as_index(&self) -> usize {
+    fn index(&self) -> usize {
         self.index as usize
     }
 }
@@ -120,7 +120,7 @@ impl Entities {
     }
 
     pub fn free(&mut self, entity: Entity) {
-        let meta = &mut self.meta[entity.as_index()];
+        let meta = &mut self.meta[entity.index()];
         if meta.generation == entity.generation {
             *meta = EntityMeta::EMPTY;
             self.free_list.push(entity);
@@ -131,7 +131,7 @@ impl Entities {
     }
 
     pub fn set_location(&mut self, entity: Entity, location: EntityLocation) {
-        let meta = &mut self.meta[entity.as_index()];
+        let meta = &mut self.meta[entity.index()];
         meta.generation = entity.generation;
         meta.location = location;
     }
@@ -158,6 +158,34 @@ impl Entities {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+#[must_use]
+pub struct ChangedLocation<T> {
+    pub entity: Entity,
+    pub changed_value: T,
+}
+
+impl ChangedLocation<ArchetypeRow> {
+    pub fn apply(&self, entities: &mut Entities) {
+        let meta = &mut entities.meta[self.entity.index()];
+        meta.location.archetype_row = self.changed_value;
+    }
+}
+
+impl ChangedLocation<TableRow> {
+    pub fn apply(&self, entities: &mut Entities) {
+        let meta = &mut entities.meta[self.entity.index()];
+        meta.location.table_row = self.changed_value;
+    }
+}
+
+impl ChangedLocation<EntityLocation> {
+    pub fn apply(&self, entities: &mut Entities) {
+        let meta = &mut entities.meta[self.entity.index()];
+        meta.location = self.changed_value;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EntityMeta {
     generation: EntityGeneration,
@@ -166,7 +194,7 @@ struct EntityMeta {
 
 impl EntityMeta {
     const EMPTY: Self = Self {
-        generation: EntityGeneration::INVALID,
+        generation: EntityGeneration::NEW,
         location: EntityLocation::INVALID,
     };
 
@@ -210,8 +238,19 @@ impl EntityLocation {
         table_row: TableRow::INVALID,
     };
 
+    pub const EMPTY: Self = Self {
+        archetype_id: ArchetypeId::EMPTY,
+        archetype_row: ArchetypeRow::INVALID,
+        table_id: TableId::EMPTY,
+        table_row: TableRow::INVALID,
+    };
+
     pub fn is_invalid(&self) -> bool {
         *self == Self::INVALID
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::EMPTY
     }
 }
 

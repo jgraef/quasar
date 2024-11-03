@@ -1,13 +1,7 @@
 use std::{
-    any::{
-        type_name,
-        TypeId,
-    },
+    any::type_name,
     collections::HashSet,
-    ptr::NonNull,
 };
-
-use bevy_ptr::OwningPtr;
 
 use crate::{
     component::{
@@ -16,10 +10,7 @@ use crate::{
         ComponentInfo,
         Components,
     },
-    storage::{
-        table::InsertIntoTable,
-        StorageType,
-    },
+    storage::table::InsertIntoTable,
     util::{
         partition_dedup,
         sparse_map::SparseMapKey,
@@ -37,20 +28,20 @@ use crate::{
 ///   callback with the same component types in the same order.
 pub unsafe trait Bundle: 'static {
     fn num_components(&self) -> usize;
-    fn for_each_component(&self, callback: impl ForEachComponent);
-    fn into_each_component(self, callback: impl IntoEachComponent);
+    fn for_each_component<C: ForEachComponent>(&self, callback: C);
+    fn into_each_component<C: IntoEachComponent>(self, callback: C);
 }
 
-unsafe impl<C: Component> Bundle for C {
+unsafe impl<T: Component> Bundle for T {
     fn num_components(&self) -> usize {
         1
     }
 
-    fn for_each_component(&self, mut callback: impl ForEachComponent) {
+    fn for_each_component<C: ForEachComponent>(&self, mut callback: C) {
         callback.call(self);
     }
 
-    fn into_each_component(self, mut callback: impl IntoEachComponent) {
+    fn into_each_component<C: IntoEachComponent>(self, mut callback: C) {
         callback.call(self)
     }
 }
@@ -60,9 +51,9 @@ unsafe impl Bundle for () {
         0
     }
 
-    fn for_each_component(&self, _callback: impl ForEachComponent) {}
+    fn for_each_component<C: ForEachComponent>(&self, _callback: C) {}
 
-    fn into_each_component(self, _callback: impl IntoEachComponent) {}
+    fn into_each_component<C: IntoEachComponent>(self, _callback: C) {}
 }
 
 pub trait ForEachComponent {
@@ -109,31 +100,44 @@ where
     }
 }
 
-pub struct InsertComponentsIntoTable<'a, 't> {
+pub struct InsertComponentsIntoTable<'a, 't, F> {
     component_ids: std::slice::Iter<'a, ComponentId>,
+    filter: F,
     insert_into_table: &'a mut InsertIntoTable<'t>,
 }
 
-impl<'a, 't> InsertComponentsIntoTable<'a, 't> {
+impl<'a, 't, F> InsertComponentsIntoTable<'a, 't, F> {
     pub fn new(
-        component_ids: &'a [ComponentId],
+        bundle_info: &'a BundleInfo,
+        filter: F,
         insert_into_table: &'a mut InsertIntoTable<'t>,
     ) -> Self {
         Self {
-            component_ids: component_ids.into_iter(),
+            component_ids: bundle_info.component_ids().iter(),
+            filter,
             insert_into_table,
         }
     }
 }
 
-impl<'a, 't> IntoEachComponent for InsertComponentsIntoTable<'a, 't> {
+impl<'a, 't, F> IntoEachComponent for InsertComponentsIntoTable<'a, 't, F>
+where
+    F: Fn(ComponentId) -> bool,
+{
     fn call<C: Component>(&mut self, component: C) {
-        let component_id = *self.component_ids.next().unwrap();
-        unsafe {
-            // SAFETY:
-            // The implementor of the Bundle trait must ensure that they only call this
-            // callback with components of the correct type.
-            self.insert_into_table.write_column(component_id, component);
+        let component_id = self
+            .component_ids
+            .next()
+            .expect("not enough component ids from bundle info");
+
+        if (self.filter)(*component_id) {
+            unsafe {
+                // SAFETY:
+                // The implementor of the Bundle trait must ensure that they only call this
+                // callback with components of the correct type.
+                self.insert_into_table
+                    .write_column(*component_id, component);
+            }
         }
     }
 }
@@ -156,6 +160,10 @@ impl BundleInfo {
 
     pub fn component_ids(&self) -> &[ComponentId] {
         &self.component_ids
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.component_ids.is_empty()
     }
 }
 
@@ -180,12 +188,12 @@ pub struct Bundles {
 }
 
 impl Bundles {
-    pub fn insert<B: Bundle>(
+    pub fn get_mut_or_insert<B: Bundle>(
         &mut self,
         bundle: &B,
         components: &mut Components,
     ) -> &mut BundleInfo {
-        let id = self.by_type_id.entry::<B>().or_insert_with(|| {
+        let occupied_entry = self.by_type_id.entry::<B>().or_insert_with(|| {
             let index = self.bundle_infos.len();
             let id = BundleId::from_index(index);
             let name = type_name::<B>();
@@ -228,7 +236,7 @@ impl Bundles {
             id
         });
 
-        &mut self.bundle_infos[id.index()]
+        &mut self.bundle_infos[occupied_entry.get().index()]
     }
 
     pub fn get<B: Bundle>(&self) -> Option<&BundleInfo> {

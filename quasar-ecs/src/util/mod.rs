@@ -5,7 +5,7 @@ pub mod sparse_set;
 pub mod type_id_map;
 
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display},
     mem::ManuallyDrop,
 };
 
@@ -64,29 +64,53 @@ pub fn partition_dedup<T: PartialEq>(slice: &mut [T]) -> (&mut [T], &mut [T]) {
     }
 }
 
-pub struct Joined<'a> {
+pub struct Joined<'a, T> {
     sep: &'a str,
-    parts: &'a [&'a str],
+    parts: &'a [T],
 }
 
-impl<'a> Joined<'a> {
-    pub fn new(sep: &'a str, parts: &'a [&'a str]) -> Self {
+impl<'a, T> Joined<'a, T> {
+    pub fn new(sep: &'a str, parts: &'a [T]) -> Self {
         Self { sep, parts }
     }
-}
 
-impl<'a> Display for Joined<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn format(&self, formatter: &mut std::fmt::Formatter, display: impl Fn(&T, &mut std::fmt::Formatter) -> std::fmt::Result) -> std::fmt::Result {
         let mut iter = self.parts.iter();
         if let Some(first) = iter.next() {
-            write!(f, "{first}")?;
+            display(first, formatter)?;
 
             while let Some(next) = iter.next() {
-                write!(f, "{}", self.sep)?;
-                write!(f, "{next}")?;
+                write!(formatter, "{}", self.sep)?;
+                display(next, formatter)?;
             }
         }
         Ok(())
+    }
+}
+
+impl<'a, T: Display> Display for Joined<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.format(f, <T as Display>::fmt)
+    }
+}
+
+impl<'a, T: Debug> Debug for Joined<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.format(f, <T as Debug>::fmt)
+    }
+}
+
+pub fn slice_get_mut_pair<'a, T>(
+    slice: &'a mut [T],
+    first: usize,
+    second: usize,
+) -> Result<(&'a mut T, &'a mut T), &'a mut T> {
+    if first == second {
+        Err(&mut slice[first])
+    }
+    else {
+        let (left, right) = slice.split_at_mut(second);
+        Ok((&mut left[first], &mut right[0]))
     }
 }
 

@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-  "quasar-ecs"
+  "quasar-ecs",
+  "quasar-ecs-derive"
 ]
+
+[workspace.dependencies.quasar-ecs-derive]
+path = "quasar-ecs-derive"

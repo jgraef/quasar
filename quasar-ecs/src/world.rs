@@ -21,6 +21,7 @@ use crate::{
         Components,
     },
     entity::{
+        ChangedLocation,
         Entities,
         EntitiesIter,
         Entity,
@@ -28,10 +29,7 @@ use crate::{
     },
     resources::Resources,
     storage::{
-        table::{
-            TableBuilder,
-            Tables,
-        },
+        table::Tables,
         StorageType,
     },
 };
@@ -89,7 +87,7 @@ impl World {
         EntityWorldMut {
             world: self,
             entity,
-            entity_location: EntityLocation::INVALID,
+            entity_location: EntityLocation::EMPTY,
         }
     }
 
@@ -241,21 +239,108 @@ impl<'a> EntityWorldMut<'a> {
     }
 
     pub fn insert(&mut self, bundle: impl Bundle) -> &mut Self {
+        // get info for this bundle
         let bundle_info = self
             .world
             .bundles
-            .insert(&bundle, &mut self.world.components);
+            .get_mut_or_insert(&bundle, &mut self.world.components);
 
-        let add_bundle_edge = self.world.archetypes.add_bundle(
+        // add bundle to the archetype graph. this creates an AddBundle edge from
+        // `self.entity_location.archetype_id` to whatever archetype we get
+        // after the insertion.
+        //
+        // this also creates the resulting archetype (and table) if necessary.
+        //
+        // if adding this bundle doesn't change the archetype (e.g. adding `()`), this
+        // returns `None`. if it does change the entity's archetype,
+        // this returns a mutable borrow for the old and new archetype.
+        if let Some((from_archetype, to_archetype)) = self.world.archetypes.add_bundle(
             self.entity_location.archetype_id,
             bundle_info,
             |component_id| self.world.components.get_component_info(component_id),
             |table| self.world.tables.insert(table),
-        );
+        ) {
+            // create a new location for our entity. we'll populate it as we get the
+            // information.
+            let mut new_entity_location = self.entity_location.clone();
+            new_entity_location.archetype_id = to_archetype.id();
+            new_entity_location.table_id = to_archetype.table_id();
 
-        //archetype.add_bundle(bundle_info.id())
+            // `Table::get_mut_pair` either returns a pair of mutable borrows of tables for
+            // the supplied table IDs, if they're not identical, or a single
+            // mutable borrow for the table
+            match self
+                .world
+                .tables
+                .get_mut_pair(from_archetype.table_id(), to_archetype.table_id())
+            {
+                Ok((from_table, to_table)) => {
+                    // moving our entity actually involves moving from a table to another table.
+                    //
+                    // `Table::move_row` will move our entity's row from `from_table` to `to_table`,
+                    // moving all the data in the columns. Note that this will
+                    // only populate columns in `to_table` that exist in both tables. In our case
+                    // we'll still need to add some components from the bundle.
+                    //
+                    // `Table::move_row` handily also returns a `InsertIntoTable`, with which we can
+                    // insert the remaining components later.
 
-        todo!();
+                    let mut move_result =
+                        unsafe { from_table.move_row(self.entity_location.table_row, to_table, self.entity) };
+
+                    new_entity_location.table_row = move_result.to_row();
+
+                    // while removing our entity from `from_table`, another row was swapped into its
+                    // place. we need to update its information
+                    if let Some(changed_location) = move_result.swapped {
+                        changed_location.apply(&mut self.world.entities);
+                    }
+
+                    // get the AddBundle edge. we need its metadata about duplicate components to
+                    // not add components from the bundle that were also moved over from
+                    // `from_table`.
+                    let add_bundle = from_archetype.add_bundle(bundle_info.id()).unwrap();
+
+                    // insert the remaining components from the bundle
+                    bundle.into_each_component(InsertComponentsIntoTable::new(
+                        &bundle_info,
+                        |component_id| !add_bundle.duplicate.contains(&component_id),
+                        &mut move_result.insert,
+                    ));
+                }
+                Err(table) => {
+                    // either both archetypes have the same table, or `from_row` is invalid, so there's nothing
+                    // to do. the bundle also can't add any components we don't
+                    // already have.
+                }
+            };
+
+            // remove our entity from `from_archetype`. this might again involve updating
+            // metadata from another entity due to swapping.
+            if let Some(changed_location) =
+                from_archetype.remove_entity(self.entity_location.archetype_row)
+            {
+                changed_location.apply(&mut self.world.entities);
+            }
+
+            // we can finally insert our entity into the new archetype
+            new_entity_location.archetype_row = to_archetype.insert_entity(ArchetypeEntity {
+                entity: self.entity,
+                table_row: new_entity_location.table_row,
+            });
+
+            // update our entity's location metadata
+            ChangedLocation {
+                entity: self.entity,
+                changed_value: new_entity_location,
+            }
+            .apply(&mut self.world.entities);
+
+            // update the cached `EntityLocation`
+            self.entity_location = new_entity_location;
+        }
+
+        self
     }
 
     pub fn remove<B: Bundle>(&mut self) -> &mut Self {
@@ -323,6 +408,8 @@ fn get_component<'a, C: Component>(
     components: &Components,
     tables: &'a Tables,
 ) -> Option<&'a C> {
+    dbg!(&entity_location);
+
     let component_id = components.get_component_id::<C>()?;
     match C::STORAGE_TYPE {
         StorageType::Table => {
@@ -351,5 +438,37 @@ fn get_component_mut<'a, C: Component>(
             }
         }
         _ => todo!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quasar_ecs_derive::Component;
+
+    use crate::World;
+
+    #[test]
+    fn spawn_component() {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Component)]
+        struct MyComponent {
+            position: u32,
+            velocity: u32,
+        }
+
+        let mut world = World::new();
+
+        let component = MyComponent { position: 42, velocity: 1312 };
+        let entity = world.spawn(component);
+        dbg!(&entity);
+        
+        // test if we can access the component from the returned `EntityWorldMut`
+        let component2 = entity.get::<MyComponent>().unwrap();
+        assert_eq!(component, *component2);
+
+        // test if we can access the entity and component from the world
+        let entity = entity.id();
+        let entity = world.get_entity(entity).unwrap();
+        let component2 = entity.get::<MyComponent>().unwrap();
+        assert_eq!(component, *component2);
     }
 }
