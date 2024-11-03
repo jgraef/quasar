@@ -5,7 +5,11 @@ pub mod sparse_set;
 pub mod type_id_map;
 
 use std::{
-    fmt::{Debug, Display},
+    cmp::Ordering,
+    fmt::{
+        Debug,
+        Display,
+    },
     mem::ManuallyDrop,
 };
 
@@ -74,7 +78,11 @@ impl<'a, T> Joined<'a, T> {
         Self { sep, parts }
     }
 
-    fn format(&self, formatter: &mut std::fmt::Formatter, display: impl Fn(&T, &mut std::fmt::Formatter) -> std::fmt::Result) -> std::fmt::Result {
+    fn format(
+        &self,
+        formatter: &mut std::fmt::Formatter,
+        display: impl Fn(&T, &mut std::fmt::Formatter) -> std::fmt::Result,
+    ) -> std::fmt::Result {
         let mut iter = self.parts.iter();
         if let Some(first) = iter.next() {
             display(first, formatter)?;
@@ -105,12 +113,16 @@ pub fn slice_get_mut_pair<'a, T>(
     first: usize,
     second: usize,
 ) -> Result<(&'a mut T, &'a mut T), &'a mut T> {
-    if first == second {
-        Err(&mut slice[first])
-    }
-    else {
-        let (left, right) = slice.split_at_mut(second);
-        Ok((&mut left[first], &mut right[0]))
+    match first.cmp(&second) {
+        Ordering::Equal => Err(&mut slice[first]),
+        Ordering::Less => {
+            let (left, right) = slice.split_at_mut(second);
+            Ok((&mut left[first], &mut right[0]))
+        }
+        Ordering::Greater => {
+            let (left, right) = slice.split_at_mut(first);
+            Ok((&mut right[0], &mut left[second]))
+        }
     }
 }
 

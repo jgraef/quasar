@@ -63,6 +63,7 @@ pub struct FieldName {
     pub span: Span,
     pub member: Member,
     pub var: Ident,
+    pub ty: Type,
 }
 
 impl FieldName {
@@ -72,6 +73,7 @@ impl FieldName {
                 span: ident.span(),
                 member: Member::Named(ident.clone()),
                 var: ident.clone(),
+                ty: ty.clone(),
             }
         }
         else {
@@ -83,6 +85,7 @@ impl FieldName {
                     span,
                 }),
                 var: Ident::new(&format!("_{index}"), span),
+                ty: ty.clone(),
             }
         }
     }

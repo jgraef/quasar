@@ -1,8 +1,15 @@
 use std::{
-    any::{type_name, TypeId}, collections::{
+    any::{
+        type_name,
+        TypeId,
+    },
+    collections::{
         hash_map,
         HashMap,
-    }, fmt::Debug, iter::FusedIterator, marker::PhantomData
+    },
+    fmt::Debug,
+    iter::FusedIterator,
+    marker::PhantomData,
 };
 
 #[derive(Clone)]
@@ -38,10 +45,13 @@ impl<T> TypeIdMap<T> {
     }
 
     pub fn insert<K: 'static>(&mut self, value: T) {
-        self.inner.insert(TypeId::of::<K>(), Item {
-            key_type_name: type_name::<K>(),
-            value,
-        });
+        self.inner.insert(
+            TypeId::of::<K>(),
+            Item {
+                key_type_name: type_name::<K>(),
+                value,
+            },
+        );
     }
 
     pub fn get<K: 'static>(&self) -> Option<&T> {
@@ -59,13 +69,13 @@ impl<T> TypeIdMap<T> {
                     key_type_name: type_name::<K>(),
                     inner: occupied_entry,
                 })
-            },
+            }
             hash_map::Entry::Vacant(vacant_entry) => {
                 Entry::Vacant(VacantEntry {
                     key_type_name: type_name::<K>(),
                     inner: vacant_entry,
                 })
-            },
+            }
         }
     }
 
@@ -97,7 +107,6 @@ pub enum Entry<'a, T> {
     Occupied(OccupiedEntry<'a, T>),
     Vacant(VacantEntry<'a, T>),
 }
-
 
 impl<'a, V> Entry<'a, V> {
     pub fn and_modify<F: FnOnce(&mut V)>(mut self, f: F) -> Self {
@@ -134,9 +143,7 @@ impl<'a, V> Entry<'a, V> {
 
     pub fn remove(self) -> Option<V> {
         match self {
-            Entry::Occupied(occupied_entry) => {
-                Some(occupied_entry.remove())
-            }
+            Entry::Occupied(occupied_entry) => Some(occupied_entry.remove()),
             Entry::Vacant(_vacant_entry) => None,
         }
     }
@@ -150,7 +157,7 @@ impl<'a, V: Default> Entry<'a, V> {
 
 pub struct OccupiedEntry<'a, V> {
     key_type_name: &'static str,
-    inner: hash_map::OccupiedEntry<'a, TypeId, Item<V>>
+    inner: hash_map::OccupiedEntry<'a, TypeId, Item<V>>,
 }
 
 impl<'a, V> OccupiedEntry<'a, V> {
@@ -167,10 +174,12 @@ impl<'a, V> OccupiedEntry<'a, V> {
     }
 
     pub fn insert(&mut self, value: V) -> V {
-        self.inner.insert(Item {
-            key_type_name: self.key_type_name,
-            value,
-        }).value
+        self.inner
+            .insert(Item {
+                key_type_name: self.key_type_name,
+                value,
+            })
+            .value
     }
 
     pub fn remove(self) -> V {
@@ -198,7 +207,7 @@ impl<'a, V> VacantEntry<'a, V> {
             key_type_name: self.key_type_name,
             inner: self.inner.insert_entry(Item {
                 key_type_name: self.key_type_name,
-                value 
+                value,
             }),
         }
     }

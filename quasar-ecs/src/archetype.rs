@@ -9,6 +9,7 @@ use crate::{
     component::{
         ComponentId,
         ComponentInfo,
+        Components,
     },
     entity::{
         ChangedLocation,
@@ -195,30 +196,70 @@ impl Archetypes {
         }
     }
 
+    fn get_or_insert_archetype_by_components(
+        &mut self,
+        component_ids: Box<[ComponentId]>,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
+    ) -> ArchetypeId {
+        let reserved_archetype_id = ArchetypeId::from_index(self.archetypes.len());
+
+        self.by_components
+            .get(&component_ids)
+            .copied()
+            .unwrap_or_else(|| {
+                // the resulting archetype doesn't exist, so we need to create it.
+                let archetype = create_archetype(reserved_archetype_id, &component_ids);
+                self.archetypes.push(archetype);
+
+                for component_id in &component_ids {
+                    // add new archetype to by_component map
+                    self.by_component
+                        .entry(*component_id)
+                        .or_default()
+                        .push(reserved_archetype_id);
+                }
+
+                // add new archetype to by_components map
+                self.by_components
+                    .insert(component_ids, reserved_archetype_id);
+
+                reserved_archetype_id
+            })
+    }
+
     pub fn add_bundle<'i, 'b>(
         &mut self,
         archetype_id: ArchetypeId,
         bundle_info: &BundleInfo,
-        get_component_info: impl Fn(ComponentId) -> &'i ComponentInfo,
-        insert_table: impl FnOnce(Table) -> TableId,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
     ) -> Option<(&mut Archetype, &mut Archetype)> {
         if bundle_info.is_empty() {
+            // inserting an empty bundle doesn't do anything
             return None;
         }
 
+        // the archetype to which we're adding a bundle. this should exist.
         let from_archetype_index = archetype_id.index();
-        let reserved_archetype_id = ArchetypeId::from_index(self.archetypes.len());
-
         let from_archetype = &mut self.archetypes[from_archetype_index];
 
+        // get the archetype id for the resulting archetype. creating the edge in the
+        // process
         let to_archetype_id =
             if let Some(add_bundle) = from_archetype.edges.add_bundle.get(&bundle_info.id()) {
+                // an edge already exists
                 add_bundle.archetype_id
             }
             else {
+                // an edge didn't exist, so we need to create it.
+
+                // the components that are already existing in `from_archetype`.
                 let existing = &from_archetype.components;
+
+                // stores any components that are added by the bundle, but already exist in
+                // `from_archetype`.
                 let mut duplicate = SparseSet::with_capacity(existing.len());
 
+                // compute the component ids for the resulting archetype
                 let mut component_ids =
                     Vec::with_capacity(existing.len() + bundle_info.component_ids().len());
                 component_ids.extend(existing.keys());
@@ -233,51 +274,20 @@ impl Archetypes {
                 component_ids.sort_unstable();
                 let component_ids: Box<[ComponentId]> = component_ids.into();
 
-                let to_archetype_id = self
-                    .by_components
-                    .get(&component_ids)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        let mut table_builder = TableBuilder::new(1, component_ids.len());
-                        let mut archetype_component_infos =
-                            SparseMap::with_capacity(component_ids.len());
+                // even if the edge didn't exist, the resulting archetype might already exist.
+                let to_archetype_id =
+                    self.get_or_insert_archetype_by_components(component_ids, create_archetype);
 
-                        for component_id in &component_ids {
-                            let component_info = get_component_info(*component_id);
-                            table_builder.add_column(component_info);
-                            archetype_component_infos
-                                .insert(component_id, ArchetypeComponentInfo::from(component_info));
-                        }
-
-                        let table_id = insert_table(table_builder.build());
-
-                        for component_id in &component_ids {
-                            self.by_component
-                                .entry(*component_id)
-                                .or_default()
-                                .push(reserved_archetype_id);
-                        }
-                        self.by_components
-                            .insert(component_ids, reserved_archetype_id);
-                        self.archetypes.push(Archetype {
-                            id: reserved_archetype_id,
-                            table_id,
-                            entities: Vec::with_capacity(1),
-                            components: archetype_component_infos.into(),
-                            edges: Edges::default(),
-                        });
-
-                        reserved_archetype_id
-                    });
-
-                let source = &mut self.archetypes[from_archetype_index];
-                source.edges.add_bundle.insert(
-                    &bundle_info.id(),
-                    AddBundle {
-                        archetype_id: to_archetype_id,
-                        duplicate: duplicate.into(),
-                    },
-                );
+                self.archetypes[from_archetype_index]
+                    .edges
+                    .add_bundle
+                    .insert(
+                        &bundle_info.id(),
+                        AddBundle {
+                            archetype_id: to_archetype_id,
+                            duplicate: duplicate.into(),
+                        },
+                    );
 
                 to_archetype_id
             };
@@ -288,6 +298,144 @@ impl Archetypes {
             to_archetype_id.index(),
         )
         .ok()
+    }
+
+    pub fn remove_bundle<'i, 'b>(
+        &mut self,
+        archetype_id: ArchetypeId,
+        bundle_info: &BundleInfo,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
+    ) -> Option<(&mut Archetype, &mut Archetype)> {
+        if bundle_info.is_empty() {
+            return None;
+        }
+
+        // the archetype to which we're adding a bundle. this should exist.
+        let from_archetype_index = archetype_id.index();
+        let from_archetype = &mut self.archetypes[from_archetype_index];
+
+        // get the archetype id for the resulting archetype. creating the edge in the
+        // process
+        let to_archetype_id = if let Some(remove_bundle) =
+            from_archetype.edges.remove_bundle.get(&bundle_info.id())
+        {
+            // an edge already exists
+            remove_bundle.archetype_id()
+        }
+        else {
+            // an edge didn't exist, so we need to create it.
+
+            // the components that need to be removed
+            let remove_components = bundle_info
+                .component_ids()
+                .iter()
+                .copied()
+                .collect::<ImmutableSparseSet<_>>();
+
+            // the components that are kept
+            let component_ids = from_archetype
+                .components
+                .keys()
+                .filter(|component_id| !remove_components.contains(component_id))
+                .collect::<Box<[ComponentId]>>();
+
+            let (to_archetype_id, edge) = if remove_components.len() + component_ids.len()
+                < from_archetype.components.len()
+            {
+                // some components from the bundle are not in the archetype
+                //let missing = bundle_info.component_ids().iter().copied()
+                //    .filter(|component_id| from_archetype.contains_component(*component_id))
+                //    .collect::<Vec<_>>();
+                (None, RemoveBundle::Mismatch)
+            }
+            else {
+                // even if the edge didn't exist, the resulting archetype might already exist.
+                let to_archetype_id =
+                    self.get_or_insert_archetype_by_components(component_ids, create_archetype);
+
+                (
+                    Some(to_archetype_id),
+                    RemoveBundle::Match {
+                        archetype_id: to_archetype_id,
+                    },
+                )
+            };
+
+            self.archetypes[from_archetype_index]
+                .edges
+                .remove_bundle
+                .insert(&bundle_info.id(), edge);
+
+            to_archetype_id
+        };
+
+        to_archetype_id.and_then(|to_archetype_id| {
+            slice_get_mut_pair(
+                &mut self.archetypes,
+                from_archetype_index,
+                to_archetype_id.index(),
+            )
+            .ok()
+        })
+    }
+}
+
+pub fn create_archetype(
+    archetype_id: ArchetypeId,
+    component_ids: &[ComponentId],
+    components: &Components,
+    tables: &mut Tables,
+) -> Archetype {
+    enum Table {
+        Existing(TableId),
+        New(TableBuilder),
+    }
+
+    impl Table {
+        fn new(tables: &mut Tables, component_ids: &[ComponentId]) -> Self {
+            if let Some(table_id) = tables.get_table_id_by_component_ids(component_ids) {
+                Table::Existing(table_id)
+            }
+            else {
+                Table::New(TableBuilder::new(1, component_ids.len()))
+            }
+        }
+
+        fn add_component(&mut self, component_info: &ComponentInfo) {
+            match self {
+                Table::Existing(_table_id) => {}
+                Table::New(table_builder) => table_builder.add_column(component_info),
+            }
+        }
+
+        fn finish(self, tables: &mut Tables) -> TableId {
+            match self {
+                Table::Existing(table_id) => table_id,
+                Table::New(table_builder) => tables.insert(table_builder.build()),
+            }
+        }
+    }
+
+    let mut table = Table::new(tables, component_ids);
+    let mut archetype_component_infos = SparseMap::with_capacity(component_ids.len());
+
+    for component_id in component_ids {
+        let component_info = components.get_component_info(*component_id);
+
+        archetype_component_infos
+            .insert(component_id, ArchetypeComponentInfo::from(component_info));
+
+        table.add_component(component_info);
+    }
+
+    let table_id = table.finish(tables);
+
+    Archetype {
+        id: archetype_id,
+        table_id,
+        entities: Vec::with_capacity(1),
+        components: archetype_component_infos.into(),
+        edges: Edges::default(),
     }
 }
 
@@ -316,6 +464,16 @@ pub struct AddBundle {
 }
 
 #[derive(Debug)]
-pub struct RemoveBundle {
-    pub output_archetype_id: ArchetypeId,
+pub enum RemoveBundle {
+    Match { archetype_id: ArchetypeId },
+    Mismatch,
+}
+
+impl RemoveBundle {
+    pub fn archetype_id(&self) -> Option<ArchetypeId> {
+        match self {
+            RemoveBundle::Match { archetype_id } => Some(*archetype_id),
+            RemoveBundle::Mismatch => None,
+        }
+    }
 }

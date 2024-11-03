@@ -12,7 +12,10 @@ use crate::{
     util::{
         drop_ptr,
         sparse_map::SparseMapKey,
-        type_id_map::{self, TypeIdMap},
+        type_id_map::{
+            self,
+            TypeIdMap,
+        },
         DropFn,
     },
 };

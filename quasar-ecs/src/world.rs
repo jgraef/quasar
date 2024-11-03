@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     num::NonZeroUsize,
     sync::atomic::{
         AtomicUsize,
@@ -8,16 +9,23 @@ use std::{
 
 use crate::{
     archetype::{
+        create_archetype,
+        Archetype,
         ArchetypeEntity,
+        ArchetypeId,
         Archetypes,
     },
     bundle::{
         Bundle,
+        BundleInfo,
         Bundles,
+        DynamicBundle,
         InsertComponentsIntoTable,
+        TakeComponentsFromTable,
     },
     component::{
         Component,
+        ComponentId,
         Components,
     },
     entity::{
@@ -29,7 +37,17 @@ use crate::{
     },
     resources::Resources,
     storage::{
-        table::Tables,
+        table::{
+            InsertIntoTable,
+            MoveRowDropUnmatched,
+            MoveRowForgetUnmatched,
+            MoveRowHandleUnmatched,
+            MoveRowPanicUnmatched,
+            Table,
+            TableId,
+            TableRow,
+            Tables,
+        },
         StorageType,
     },
 };
@@ -91,10 +109,26 @@ impl World {
         }
     }
 
-    pub fn spawn(&mut self, bundle: impl Bundle) -> EntityWorldMut {
+    pub fn spawn(&mut self, bundle: impl DynamicBundle) -> EntityWorldMut {
         let mut entity = self.spawn_empty();
         entity.insert(bundle);
         entity
+    }
+
+    pub fn despawn(&mut self, entity: Entity) {
+        if let Some(entity) = self.get_entity_world_mut(entity) {
+            entity.despawn();
+        }
+    }
+
+    pub fn take<B: Bundle>(&mut self, entity: Entity) -> Option<B> {
+        self.get_entity_world_mut(entity)?.take()
+    }
+
+    pub fn remove<B: Bundle>(&mut self, entity: Entity) {
+        if let Some(mut entity) = self.get_entity_world_mut(entity) {
+            entity.remove::<B>();
+        }
     }
 
     pub fn get_entity(&self, entity: Entity) -> Option<EntityRef> {
@@ -114,6 +148,15 @@ impl World {
             components: &self.components,
             archetypes: &self.archetypes,
             tables: &mut self.tables,
+            entity,
+            entity_location,
+        })
+    }
+
+    pub fn get_entity_world_mut(&mut self, entity: Entity) -> Option<EntityWorldMut> {
+        let entity_location = self.entities.get_location(entity)?;
+        Some(EntityWorldMut {
+            world: self,
             entity,
             entity_location,
         })
@@ -238,27 +281,64 @@ impl<'a> EntityWorldMut<'a> {
         todo!();
     }
 
-    pub fn insert(&mut self, bundle: impl Bundle) -> &mut Self {
-        // get info for this bundle
-        let bundle_info = self
-            .world
-            .bundles
-            .get_mut_or_insert(&bundle, &mut self.world.components);
+    pub fn insert(&mut self, bundle: impl DynamicBundle) -> &mut Self {
+        self.insert_remove_take_inner(InsertOp { bundle });
+        self
+    }
 
-        // add bundle to the archetype graph. this creates an AddBundle edge from
-        // `self.entity_location.archetype_id` to whatever archetype we get
-        // after the insertion.
+    pub fn remove<B: Bundle>(&mut self) {
+        self.insert_remove_take_inner(RemoveOp::<B> {
+            _bundle: PhantomData,
+        });
+    }
+
+    #[must_use]
+    pub fn take<B: Bundle>(&mut self) -> Option<B> {
+        self.insert_remove_take_inner(TakeOp::<B> {
+            _bundle: PhantomData,
+        })
+    }
+
+    /// Helper method to perform [`insert`], [`remove`] and [`take`].
+    ///
+    /// [`insert`], [`remove`] and [`take`] are very similar since they all move
+    /// an entity from one archetype to another, moving its data from one table
+    /// to another. More specifically, sometimes they don't actually need to
+    /// move between archetypes or tables (e.g. inserting `()`). All these
+    /// operations are done using this general method, and are specialized
+    /// via the `op` parameter and the [`InsertRemoveTakeOp`] trait.
+    fn insert_remove_take_inner<O: InsertRemoveTakeOp>(&mut self, op: O) -> Option<O::Output> {
+        // if this op produces an output (i.e. take), it might store it here. this might
+        // also stay None, if the operation fails (e.g. the entity doesn't contain the
+        // full bundle)
+        let mut output = None;
+
+        // get info for this bundle
+        let bundle_info = op.get_bundle_info(&mut self.world.bundles, &mut self.world.components);
+
+        // add/remove bundle to the archetype graph. this creates an
+        // AddBundle/RemoveBundle edge from `self.entity_location.archetype_id`
+        // to whatever archetype we get after the insertion.
         //
-        // this also creates the resulting archetype (and table) if necessary.
+        // this also creates the resulting archetype (and table) if necessary, by
+        // calling the provided closure.
         //
-        // if adding this bundle doesn't change the archetype (e.g. adding `()`), this
-        // returns `None`. if it does change the entity's archetype,
+        // if adding/removing this bundle doesn't change the archetype (e.g. adding
+        // `()`), this returns `None`. if it does change the entity's archetype,
         // this returns a mutable borrow for the old and new archetype.
-        if let Some((from_archetype, to_archetype)) = self.world.archetypes.add_bundle(
+
+        if let Some((from_archetype, to_archetype)) = op.get_bundle_edge(
+            &mut self.world.archetypes,
             self.entity_location.archetype_id,
             bundle_info,
-            |component_id| self.world.components.get_component_info(component_id),
-            |table| self.world.tables.insert(table),
+            |archetype_id, component_ids| {
+                create_archetype(
+                    archetype_id,
+                    component_ids,
+                    &self.world.components,
+                    &mut self.world.tables,
+                )
+            },
         ) {
             // create a new location for our entity. we'll populate it as we get the
             // information.
@@ -276,7 +356,13 @@ impl<'a> EntityWorldMut<'a> {
             {
                 Ok((from_table, to_table)) => {
                     // moving our entity actually involves moving from a table to another table.
-                    //
+
+                    // first take out anything we want to return
+                    // note: if the op takes out anything it must make sure it's only components
+                    // that are not moved to the new table, and those are forgotten when
+                    // `from_table.move_row` handles them as unmatched.
+                    output = Some(op.take(bundle_info, from_table, self.entity_location.table_row));
+
                     // `Table::move_row` will move our entity's row from `from_table` to `to_table`,
                     // moving all the data in the columns. Note that this will
                     // only populate columns in `to_table` that exist in both tables. In our case
@@ -285,8 +371,14 @@ impl<'a> EntityWorldMut<'a> {
                     // `Table::move_row` handily also returns a `InsertIntoTable`, with which we can
                     // insert the remaining components later.
 
-                    let mut move_result =
-                        unsafe { from_table.move_row(self.entity_location.table_row, to_table, self.entity) };
+                    let mut move_result = unsafe {
+                        from_table.move_row(
+                            self.entity_location.table_row,
+                            to_table,
+                            self.entity,
+                            op.handle_unmatched(),
+                        )
+                    };
 
                     new_entity_location.table_row = move_result.to_row();
 
@@ -296,22 +388,14 @@ impl<'a> EntityWorldMut<'a> {
                         changed_location.apply(&mut self.world.entities);
                     }
 
-                    // get the AddBundle edge. we need its metadata about duplicate components to
-                    // not add components from the bundle that were also moved over from
-                    // `from_table`.
-                    let add_bundle = from_archetype.add_bundle(bundle_info.id()).unwrap();
-
                     // insert the remaining components from the bundle
-                    bundle.into_each_component(InsertComponentsIntoTable::new(
-                        &bundle_info,
-                        |component_id| !add_bundle.duplicate.contains(&component_id),
-                        &mut move_result.insert,
-                    ));
+                    op.insert(bundle_info, &mut move_result.insert, from_archetype);
                 }
-                Err(table) => {
-                    // either both archetypes have the same table, or `from_row` is invalid, so there's nothing
-                    // to do. the bundle also can't add any components we don't
-                    // already have.
+                Err(_table) => {
+                    // either both archetypes have the same table, or `from_row`
+                    // is invalid, so there's nothing to do.
+                    // the bundle also can't add any components we don't
+                    // already have, or remove any components.
                 }
             };
 
@@ -340,19 +424,7 @@ impl<'a> EntityWorldMut<'a> {
             self.entity_location = new_entity_location;
         }
 
-        self
-    }
-
-    pub fn remove<B: Bundle>(&mut self) -> &mut Self {
-        let _ = self.take::<B>();
-        self
-    }
-
-    #[must_use]
-    pub fn take<B: Bundle>(&mut self) -> Option<B> {
-        let bundle_info = self.world.bundles.get::<B>()?;
-
-        todo!();
+        output
     }
 
     pub fn world(&self) -> &World {
@@ -441,8 +513,199 @@ fn get_component_mut<'a, C: Component>(
     }
 }
 
+unsafe trait InsertRemoveTakeOp {
+    type Output;
+
+    fn get_bundle_info<'a>(
+        &self,
+        bundles: &'a mut Bundles,
+        components: &mut Components,
+    ) -> &'a BundleInfo;
+
+    fn get_bundle_edge<'a>(
+        &self,
+        archetypes: &'a mut Archetypes,
+        archetype_id: ArchetypeId,
+        bundle_info: &BundleInfo,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
+    ) -> Option<(&'a mut Archetype, &'a mut Archetype)>;
+
+    fn handle_unmatched(&self) -> impl MoveRowHandleUnmatched;
+
+    fn insert(
+        self,
+        bundle_info: &BundleInfo,
+        insert_into_table: &mut InsertIntoTable,
+        from_archetype: &Archetype,
+    );
+
+    fn take(
+        &self,
+        bundle_info: &BundleInfo,
+        table: &mut Table,
+        table_row: TableRow,
+    ) -> Self::Output;
+}
+
+struct InsertOp<B> {
+    bundle: B,
+}
+
+unsafe impl<B: DynamicBundle> InsertRemoveTakeOp for InsertOp<B> {
+    type Output = ();
+
+    fn get_bundle_info<'a>(
+        &self,
+        bundles: &'a mut Bundles,
+        components: &mut Components,
+    ) -> &'a BundleInfo {
+        bundles.get_mut_or_insert_dynamic(&self.bundle, components)
+    }
+
+    fn get_bundle_edge<'a>(
+        &self,
+        archetypes: &'a mut Archetypes,
+        archetype_id: ArchetypeId,
+        bundle_info: &BundleInfo,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
+    ) -> Option<(&'a mut Archetype, &'a mut Archetype)> {
+        archetypes.add_bundle(archetype_id, bundle_info, create_archetype)
+    }
+
+    fn handle_unmatched(&self) -> impl MoveRowHandleUnmatched {
+        MoveRowPanicUnmatched
+    }
+
+    fn insert(
+        self,
+        bundle_info: &BundleInfo,
+        insert_into_table: &mut InsertIntoTable,
+        from_archetype: &Archetype,
+    ) {
+        // get the AddBundle edge. we need its metadata about duplicate components to
+        // not add components from the bundle that were also moved over from
+        // `from_table`.
+        let add_bundle = from_archetype.add_bundle(bundle_info.id()).unwrap();
+
+        // insert the remaining components from the bundle
+        self.bundle.into_components(InsertComponentsIntoTable::new(
+            bundle_info,
+            |component_id| !add_bundle.duplicate.contains(&component_id),
+            insert_into_table,
+        ));
+    }
+
+    fn take(
+        &self,
+        _bundle_info: &BundleInfo,
+        _table: &mut Table,
+        _table_row: TableRow,
+    ) -> Self::Output {
+        ()
+    }
+}
+
+struct RemoveOp<B> {
+    _bundle: PhantomData<B>,
+}
+
+unsafe impl<B: Bundle> InsertRemoveTakeOp for RemoveOp<B> {
+    type Output = ();
+
+    fn get_bundle_info<'a>(
+        &self,
+        bundles: &'a mut Bundles,
+        components: &mut Components,
+    ) -> &'a BundleInfo {
+        bundles.get_mut_or_insert_static::<B>(components)
+    }
+
+    fn get_bundle_edge<'a>(
+        &self,
+        archetypes: &'a mut Archetypes,
+        archetype_id: ArchetypeId,
+        bundle_info: &BundleInfo,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
+    ) -> Option<(&'a mut Archetype, &'a mut Archetype)> {
+        archetypes.remove_bundle(archetype_id, bundle_info, create_archetype)
+    }
+
+    fn handle_unmatched(&self) -> impl MoveRowHandleUnmatched {
+        MoveRowDropUnmatched
+    }
+
+    fn insert(
+        self,
+        _bundle_info: &BundleInfo,
+        _insert_into_table: &mut InsertIntoTable,
+        _from_archetype: &Archetype,
+    ) {
+    }
+
+    fn take(
+        &self,
+        _bundle_info: &BundleInfo,
+        _table: &mut Table,
+        _table_row: TableRow,
+    ) -> Self::Output {
+        ()
+    }
+}
+
+struct TakeOp<B> {
+    _bundle: PhantomData<B>,
+}
+
+unsafe impl<B: Bundle> InsertRemoveTakeOp for TakeOp<B> {
+    type Output = B;
+
+    fn get_bundle_info<'a>(
+        &self,
+        bundles: &'a mut Bundles,
+        components: &mut Components,
+    ) -> &'a BundleInfo {
+        bundles.get_mut_or_insert_static::<B>(components)
+    }
+
+    fn get_bundle_edge<'a>(
+        &self,
+        archetypes: &'a mut Archetypes,
+        archetype_id: ArchetypeId,
+        bundle_info: &BundleInfo,
+        create_archetype: impl FnOnce(ArchetypeId, &[ComponentId]) -> Archetype,
+    ) -> Option<(&'a mut Archetype, &'a mut Archetype)> {
+        archetypes.remove_bundle(archetype_id, bundle_info, create_archetype)
+    }
+
+    fn handle_unmatched(&self) -> impl MoveRowHandleUnmatched {
+        MoveRowForgetUnmatched
+    }
+
+    fn insert(
+        self,
+        _bundle_info: &BundleInfo,
+        _insert_into_table: &mut InsertIntoTable,
+        _from_archetype: &Archetype,
+    ) {
+    }
+
+    fn take(
+        &self,
+        bundle_info: &BundleInfo,
+        table: &mut Table,
+        table_row: TableRow,
+    ) -> Self::Output {
+        B::from_components(TakeComponentsFromTable::new(bundle_info, table, table_row))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{
+        AtomicBool,
+        Ordering,
+    };
+
     use quasar_ecs_derive::Component;
 
     use crate::World;
@@ -457,10 +720,12 @@ mod tests {
 
         let mut world = World::new();
 
-        let component = MyComponent { position: 42, velocity: 1312 };
+        let component = MyComponent {
+            position: 42,
+            velocity: 1312,
+        };
         let entity = world.spawn(component);
-        dbg!(&entity);
-        
+
         // test if we can access the component from the returned `EntityWorldMut`
         let component2 = entity.get::<MyComponent>().unwrap();
         assert_eq!(component, *component2);
@@ -470,5 +735,131 @@ mod tests {
         let entity = world.get_entity(entity).unwrap();
         let component2 = entity.get::<MyComponent>().unwrap();
         assert_eq!(component, *component2);
+    }
+
+    #[test]
+    fn spawn_empty() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        world.get_entity(entity).unwrap();
+    }
+
+    #[test]
+    fn remove_component() {
+        #[derive(Component)]
+        struct MyComponent;
+
+        let mut world = World::new();
+        let mut entity = world.spawn(MyComponent);
+        entity.remove::<MyComponent>();
+
+        assert!(entity.get::<MyComponent>().is_none());
+    }
+
+    #[test]
+    fn it_doesnt_drop_inserted_components() {
+        static WAS_DROPPED: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component)]
+        struct MyComponent;
+
+        impl Drop for MyComponent {
+            fn drop(&mut self) {
+                WAS_DROPPED.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let mut world = World::new();
+        let _ = world.spawn(MyComponent);
+
+        assert!(!WAS_DROPPED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn it_doesnt_drop_taken_components() {
+        static WAS_DROPPED: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component)]
+        struct MyComponent;
+
+        impl Drop for MyComponent {
+            fn drop(&mut self) {
+                WAS_DROPPED.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let mut world = World::new();
+        let mut entity = world.spawn(MyComponent);
+        let _component = entity.take::<MyComponent>().unwrap();
+
+        assert!(!WAS_DROPPED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn it_does_drop_components_when_world_is_dropped() {
+        static WAS_DROPPED: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component)]
+        struct MyComponent;
+
+        impl Drop for MyComponent {
+            fn drop(&mut self) {
+                WAS_DROPPED.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let mut world = World::new();
+        let _ = world.spawn(MyComponent);
+        drop(world);
+
+        assert!(WAS_DROPPED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn it_does_drop_components_when_theyre_removed() {
+        static WAS_DROPPED: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component)]
+        struct MyComponent;
+
+        impl Drop for MyComponent {
+            fn drop(&mut self) {
+                WAS_DROPPED.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let mut world = World::new();
+        let mut entity = world.spawn(MyComponent);
+        entity.remove::<MyComponent>();
+
+        assert!(WAS_DROPPED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn take_component() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Component)]
+        struct MyComponent(u32);
+
+        let mut world = World::new();
+        let component = MyComponent(1312);
+        let mut entity = world.spawn(component);
+
+        let component2 = entity.take::<MyComponent>().unwrap();
+        assert_eq!(component, component2);
+    }
+
+    #[test]
+    fn taking_a_component_twice_fails() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Component)]
+        struct MyComponent(u32);
+
+        let mut world = World::new();
+        let component = MyComponent(1312);
+        let mut entity = world.spawn(component);
+
+        let component2 = entity.take::<MyComponent>().unwrap();
+        assert_eq!(component, component2);
+
+        assert!(entity.take::<MyComponent>().is_none());
     }
 }

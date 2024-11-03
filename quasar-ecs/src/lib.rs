@@ -14,7 +14,7 @@ extern crate alloc;
 extern crate self as quasar_ecs;
 
 pub use crate::{
-    bundle::Bundle,
+    bundle::DynamicBundle,
     component::Component,
     storage::StorageType,
     world::{
@@ -27,9 +27,10 @@ pub use crate::{
 };
 
 #[doc(hidden)]
-pub mod __private {
+pub mod bundle_impl {
     pub use crate::bundle::{
-        ForEachComponent,
-        IntoEachComponent,
+        ComponentTypesCallback,
+        FromComponentsCallback,
+        IntoComponentsCallback,
     };
 }

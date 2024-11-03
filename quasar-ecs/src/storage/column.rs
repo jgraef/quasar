@@ -76,4 +76,17 @@ impl Column {
     pub unsafe fn remove_item(&mut self, index: usize) {
         self.data.swap_remove_and_drop_unchecked(index);
     }
+
+    pub unsafe fn take_item<T>(&mut self, index: usize) -> T {
+        let ptr = self.data.swap_remove_and_forget_unchecked(index);
+        ptr.read::<T>()
+    }
+
+    pub unsafe fn take_item_and_remove_later<T>(&mut self, index: usize) -> T {
+        self.data.get_unchecked_mut(index).promote().read()
+    }
+
+    pub unsafe fn forget_item(&mut self, index: usize) {
+        self.data.swap_remove_and_forget_unchecked(index);
+    }
 }
